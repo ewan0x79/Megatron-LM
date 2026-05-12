@@ -992,6 +992,9 @@ class TestTextGenerationController(TextGenerationControllerTestBase):
             [3, 3], dtype=torch.int32, device='cuda'
         )  # 1 sampled + 2 spec
         ctx.num_prefill_requests = 0
+        ctx.active_request_metadata["temperature"][:2] = 0.0
+        ctx.active_request_metadata["top_k"][:2] = 1
+        ctx.active_request_metadata["top_p"][:2] = 0.0
         ctx.pad_active_slices()
 
         # Init accepted tokens tensors
@@ -1001,28 +1004,15 @@ class TestTextGenerationController(TextGenerationControllerTestBase):
         # Target tokens (what the model was fed): [T0, T1, T2, T3, T4, T5]
         input_ids = torch.tensor([[10, 11, 12, 20, 21, 22]], device='cuda')
 
-        # We need the sampling function to return a 1D tensor for base logits,
-        # and a 1D tensor for the flattened MTP logits.
-        def mock_sampling_func(logits, *args, **kwargs):
-            if logits.shape[0] == 6:
-                # Base logits -> return 1D tensor of shape [6]
-                # Req 1: Predicts [11, 12, 99]. Matches T1, T2. Rejects T3. -> Accepts 2 spec tokens.
-                # Req 2: Predicts [99, 22, 23]. Fails at first spec token (99 != 21). -> Accepts 0 spec tokens.
-                return torch.tensor([11, 12, 99, 99, 22, 23], dtype=torch.long, device='cuda')
-            else:
-                # MTP logits -> return 1D tensor of shape [12]
-                # The verification logic only uses base tokens, so we can return zeros here.
-                return torch.zeros((12,), dtype=torch.long, device='cuda')
-
-        # Override sampling to return our predictable mock outputs.
-        self.text_generation_controller._sampling.sample_kernel = mock.MagicMock(
-            side_effect=mock_sampling_func
-        )
-
-        # Mock logits matching input shape
-        logits = torch.randn(1, 6, self.vocab_size, device='cuda')
+        # Deterministic greedy logits. Req 1 predicts [11, 12, 99], so it
+        # accepts 2 speculative tokens. Req 2 predicts [99, 22, 23], so it
+        # rejects at the first speculative token.
+        expected_samples = torch.tensor([11, 12, 99, 99, 22, 23], device='cuda')
+        logits = torch.full((1, 6, self.vocab_size), -1000.0, device='cuda')
+        logits[0, torch.arange(6, device='cuda'), expected_samples] = 1000.0
         self.text_generation_controller._all_logits_cuda = logits
 
+        self.text_generation_controller._dynamic_step_sample_bookkeeping()
         self.text_generation_controller._dynamic_step_sample_logits_and_verify_tokens(input_ids)
 
         # Verify acceptance counts
@@ -1258,6 +1248,7 @@ class TestTextGenerationController(TextGenerationControllerTestBase):
 
         self.text_generation_controller._all_logits_cuda = logits
         try:
+            self.text_generation_controller._dynamic_step_sample_bookkeeping()
             self.text_generation_controller._dynamic_step_sample_logits_and_verify_tokens(input_ids)
         except RuntimeError as e:
             if "prob_dist must be 1 or 2 dim" in str(e):

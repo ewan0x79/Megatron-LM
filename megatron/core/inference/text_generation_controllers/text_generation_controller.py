@@ -1289,6 +1289,9 @@ class TextGenerationController:
         """
         context = self.inference_wrapped_model.inference_context
         active_request_count = context.total_request_count - context.paused_request_count
+        request_in_prefill_status_tensor = context.gpu_view.request_in_prefill_status[
+            :active_request_count
+        ]
 
         # Sampling-side request counts: padded when running a captured graph.
         # Verify uses the actual counts so the Triton kernels operate on the real workload.
