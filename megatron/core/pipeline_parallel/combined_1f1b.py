@@ -77,7 +77,12 @@ def combined_1f1b_schedule_for_no_pipelining(
     with no_sync_func():
         for i in range(num_microbatches - 1):
             total_num_tokens += num_tokens
-            output_tensor, num_tokens, _ = combined_forward_backward_step(
+            # Stage the new return into a temp so we can release the previous
+            # microbatch's `output_tensor` (the b_output_tensor we just
+            # backwarded) BEFORE rebinding. Without this, its autograd-graph
+            # teardown is deferred onto the next iteration's dispatch path.
+            # See issue #4124.
+            _new_output_tensor, _new_num_tokens, _ = combined_forward_backward_step(
                 forward_step_func,
                 data_iterator,
                 model,  # f_model
@@ -94,10 +99,13 @@ def combined_1f1b_schedule_for_no_pipelining(
                 is_first_microbatch=check_first_val_step((i + 1) == 0),
                 current_microbatch=(i + 1),
             )
+            del output_tensor
+            output_tensor, num_tokens = _new_output_tensor, _new_num_tokens
+            del _new_output_tensor
     total_num_tokens += num_tokens
     # The backward step for the last microbatch is executed alone, no a2a overlapping
     # Run computation for last microbatch out of context handler (want to synchronize gradients).
-    output_tensor, num_tokens, _ = combined_forward_backward_step(
+    _new_output_tensor, _new_num_tokens, _ = combined_forward_backward_step(
         forward_step_func,
         data_iterator,
         None,  # f_model
@@ -110,6 +118,9 @@ def combined_1f1b_schedule_for_no_pipelining(
         output_tensor_grad,  # b_output_tensor_grad
         config,
     )
+    del output_tensor
+    output_tensor, num_tokens = _new_output_tensor, _new_num_tokens
+    del _new_output_tensor
     return forward_data_store, total_num_tokens
 
 
